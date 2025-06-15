@@ -70,7 +70,7 @@ def is_emptyline(line):
 
 
 def is_identifier(token):
-    identifier_regex = re.compile(r'^[-a-zA-Z0-9_]+[\*]{1}$')
+    identifier_regex = re.compile(r'^[-a-zA-Z0-9_]+[\*]?$')
     mtch = identifier_regex.match(token)
     return mtch and mtch.group()
 
@@ -217,7 +217,6 @@ def is_group(contents, i):
             i += 1
             continue
         else:
-            breakpoint()
             break
 
     # *(rule / emptyline)
