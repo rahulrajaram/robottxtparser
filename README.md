@@ -13,12 +13,17 @@ Program processes a robot.txt file to verify that it is legal according to the g
 
  startgroupline = *WS "user-agent" *WS ":" *WS product-token EOL
 
+ nonstandard-field = "crawl-delay"
+
+ nonstandard-rule = *WS nonstandard-field *WS ":" *WS value EOL
 
  rule = *WS ("allow" / "disallow") *WS ":"
        *WS (path-pattern / empty-pattern) EOL
 
  ; parser implementors: define additional lines you need (for
  ; example, Sitemaps).
+
+sitemap-rule = *WS "sitemap" *WS ":" *WS URI EOL
 
  product-token = identifier 1"*" / "*"
  path-pattern = "/" *UTF8-char-noctl ; valid URI path pattern
@@ -40,6 +45,8 @@ it:
 2. allows for either an emptyline or a straightgroupline as the first expression within a group;
 the RFC expects the first line to be a group
 3. allows digits in identifiers for user-agent names
+4. supports crawl-delay with floating point values
+5. supports Sitemaps nominally
 
 ## 2. Running
 ```
