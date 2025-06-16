@@ -45,9 +45,15 @@ the RFC expects the first line to be a group
 3. allows digits in identifiers for user-agent names
 4. supports crawl-delay with floating point values
 5. supports Sitemaps nominally
+
+Restrictions:
+1. There is basic support for Crawl-delay, but it must appear within a user-agent rules group
+2. All Sitemaps must appear towards the end
 """
 import os
 import re
+
+import json
 
 import argparse
 
@@ -91,7 +97,7 @@ def is_path_pattern(token):
     path-pattern = "/" *UTF8-char-noctl
     Where UTF8-char-noctl excludes control characters (0x00–0x1F, 0x7F).
     """
-    if not token.startswith('/') and not token.startswith('*/'):
+    if not token.startswith('/') and not token.startswith('*'):
         return False
     try:
         token.encode('utf-8')
@@ -120,20 +126,23 @@ def is_rule(line):
             break
         i += 1
 
-    # ("allow" / "disallow") *WS ":" 
-    if i < len(tokens) and tokens[i].lower() in ['allow', 'disallow']:    
+    allow_disallow_label = None
+    # ("allow" / "disallow") *WS ":"
+    if i < len(tokens) and tokens[i].lower() in ['allow', 'disallow']:
+        allow_disallow_label = tokens[i].lower()
         i += 1
         while i < len(tokens):
             if not is_WS(tokens[i]):
                 break
             i += 1
         if i == len(tokens) or not tokens[i] != ":":
-            return False
+            return False, {}
         i += 1
     elif i < len(tokens) and tokens[i].lower() in ['allow:', 'disallow:']:
+        allow_disallow_label = tokens[i].split(':')[0].lower()
         i += 1
     else:
-        return False
+        return False, {}
     
     # *WS
     while i < len(tokens):
@@ -142,14 +151,21 @@ def is_rule(line):
         i += 1
 
     # (path-pattern / empty-pattern) EOL
+    path_pattern = None
     if i < len(tokens) and is_path_pattern(tokens[i]):
+        path_pattern = tokens[i]
         i += 1
-    else:
+    else:       
         while i < len(tokens):
             if not is_WS(tokens[i]):
                 break
             i += 1
-    return i == len(tokens)
+    return (
+        i == len(tokens),
+        {
+            allow_disallow_label: path_pattern
+        }
+    )
 
 
 def is_startgroupline(line):
@@ -177,11 +193,11 @@ def is_startgroupline(line):
                 break
             i += 1
         if i == len(tokens) or not tokens[i] != ':':
-            return False
+            return False, {}
     elif i < len(tokens) and tokens[i].lower() == 'user-agent:':
         i += 1
     else:
-        return False
+        return False, {}
 
     # *WS
     while i < len(tokens):
@@ -195,15 +211,21 @@ def is_startgroupline(line):
             f"Expected identifier but found EOL at {line}."
         )
 
+    user_agent = []
     while i < len(tokens):
         if not is_product_token(tokens[i]):
             raise ValueError(
                 f"Expected identifier but found {tokens[i]}. "
                 "Identifiers follow the regex r'^[-a-zA-Z0-9_]+[\\*]{1}$'"
             )
+        user_agent.append(tokens[i])
         i += 1
+    user_agent = " ".join(user_agent)
 
-    return i == len(tokens)
+    return (
+        i == len(tokens),
+        user_agent
+    )
 
 
 def is_nonstandard_rule(line):
@@ -226,13 +248,13 @@ def is_nonstandard_rule(line):
                 break
             i += 1
         if i == len(tokens) or not tokens[i] != ':':
-            return False
+            return False, None
     elif i < len(tokens) and tokens[i].lower() in [
         "crawl-delay:"
     ]:
         i += 1
     else:
-        return False
+        return False, None
 
     # *WS
     while i < len(tokens):
@@ -243,7 +265,9 @@ def is_nonstandard_rule(line):
     # product-token EOL
     if i < len(tokens):
         try:
-            float(tokens[i])
+            crawl_delay = float(tokens[i])
+            i += 1
+            return i == len(tokens), crawl_delay
         except ValueError:
             raise ValueError(
                 f"Expected floating-point value but found {tokens[i]} at {line}."
@@ -253,11 +277,8 @@ def is_nonstandard_rule(line):
             f"Expected floating-point value but found EOL at {line}."
         )
 
-    i += 1
-    return i == len(tokens)
 
-
-def is_group(contents, i):
+def is_group(contents, i, current_group, ignore_unsupported=False):
     """
     Handle:
 
@@ -268,13 +289,23 @@ def is_group(contents, i):
                                             ; user-agent lines
     """
     if not len(contents):
-        return False, i
+        return False, i, {}
     # i += 1
 
+    current_user_agent = None
+    if current_group:
+        current_user_agent = list(current_group.keys())[0]
     # *(startgroupline / emptyline)
     group_found = False
     while i < len(contents):
-        if is_startgroupline(contents[i]):
+        ret, user_agent = is_startgroupline(contents[i])
+        if ret:
+            current_group = {
+                user_agent: {
+                    "allow": set(),
+                    "disallow": set(),
+                }
+            }
             i += 1
             group_found = True
         elif is_emptyline(contents[i]):
@@ -283,12 +314,17 @@ def is_group(contents, i):
         else:
             break
     if group_found:
-        return True, i
+        return True, i, current_group
 
     # *(rule / emptyline)
     while i < len(contents):
-        if is_rule(contents[i]):
+        ret, allow_disallow = is_rule(contents[i])
+        if ret:
             i += 1
+            if allow_disallow.get('allow'):
+                current_group[current_user_agent]['allow'].add(allow_disallow['allow'])
+            if allow_disallow.get('disallow'):
+                current_group[current_user_agent]['disallow'].add(allow_disallow['disallow'])
             group_found = True
         elif is_emptyline(contents[i]):
             i += 1
@@ -296,11 +332,23 @@ def is_group(contents, i):
         else:
             break
     if group_found:
-        return True, i
+        return True, i, current_group
 
     while i < len(contents):
-        if is_nonstandard_rule(contents[i]):
+        ret, crawl_delay = is_nonstandard_rule(contents[i])
+        if ret:
+            if not current_user_agent or current_user_agent == 'sitemaps':
+                if not ignore_unsupported:
+                    raise RuntimeError(
+                        "Found crawl-delay definition after sitemap definition.\n"
+                        f"\n\t{contents[i]}\n"
+                        "All crawl-delay definitions must appear within a user-agent group definition. "
+                        "All sitemap definitions must appear at the end."
+                    )
+                else:
+                    return True, i + 1, current_group
             i += 1
+            current_group[current_user_agent]['crawl-delay'] = crawl_delay
             group_found = True
         elif is_emptyline(contents[i]):
             i += 1
@@ -308,12 +356,16 @@ def is_group(contents, i):
         else:
             break
     if group_found:
-        return True, i
+        return True, i, current_group
 
+    current_group = {
+        'sitemaps': set()
+    }
     while i < len(contents):
-        if contents[i].lower().startswith('sitemap'):
+        if contents[i].lower().startswith('sitemap:'):       
+            current_group['sitemaps'].add(contents[i][8:].strip().split('sitemap:')[0])
             i += 1
-            
+
             group_found = True
         elif is_emptyline(contents[i]):
             i += 1
@@ -321,14 +373,16 @@ def is_group(contents, i):
         else:
             break
     if group_found:
-        return True, i
+        return True, i, current_group
 
-    raise RuntimeError(
-        f"Expected to find a startgroupline, a rule, a crawl-delay, or a sitemap, but found {contents[i]}."
-    )
+    if not ignore_unsupported:
+        raise RuntimeError(
+            f"Expected to find a startgroupline, a rule, a crawl-delay, or a sitemap, but found {contents[i]}."
+        )
+    return True, i + 1, current_group
 
 
-def is_robotstxt(contents):
+def is_robotstxt(contents, ignore_unsupported=False):
     """
     Handle:
 
@@ -336,23 +390,41 @@ def is_robotstxt(contents):
 
     """
     i = 0
+    global_map = {
+        'user-agent-groups': dict(),
+        'sitemaps': set(),
+    }
+
+    current_group = {}
     while i < len(contents):
-        ret, i = is_group(contents, i)
+        ret, i, current_group = is_group(contents, i, current_group, ignore_unsupported)
         if not ret:
             return False
+        if not current_group:
+            continue
+        if current_group:
+            user_agent_key = list(current_group.keys())[0]
+            global_map['user-agent-groups'][user_agent_key] = current_group[user_agent_key]
+        if current_group.get('sitemaps'):
+            global_map['sitemaps'] = current_group['sitemaps']
         if i == len(contents):
-            return True
+            return True, global_map
 
 
-def is_valid(path):
+def is_valid(path, ignore_unsupported):
     if not os.path.isfile(path):
         raise FileNotFoundError(f"File not found: {path}")
     with open(path, 'r', encoding='utf-8') as file:
         contents = [line.strip() for line in file.read().split('\n') if line.strip()]
-    return is_robotstxt(contents)
+    ret, global_map = is_robotstxt(contents, ignore_unsupported)
+    return ret, global_map
 
 
-def main():
+def validate_url(robot_file, url):
+    ret, global_map = is_valid(robot_file)
+    
+
+def main(): 
     parser = argparse.ArgumentParser(description="Validate a robots.txt file.")
     parser.add_argument(
         "path",
@@ -360,8 +432,36 @@ def main():
         default="./robots.txt",
         help="Path to robots.txt file (default: ./robots.txt)"
     )
+    parser.add_argument(
+        "-u", "--url",
+        help="Path to robots.txt file (default: ./robots.txt)"
+    )
+    parser.add_argument(
+        "-s", "--skip-validation",
+        help="Skip validation of the robots.txt file during URL matching"
+    )
+    parser.add_argument(
+        "-i", "--ignore-unsupported",
+        action='store_true',
+        help="Ignore rules like Noindex rather than erroring on encountering them"
+    )
+    parser.add_argument(
+        "-d", "--debug",
+        action='store_true',
+        help="Emit debug logs"
+    )
     args = parser.parse_args()
-    is_valid(args.path)
+
+    try:
+        if args.skip_validation and args.url:
+            validate_url(args.path, args.url)
+        elif args.path:
+            is_valid(args.path, args.ignore_unsupported)
+    except Exception as e:
+        if args.debug:
+            import traceback
+            print(traceback.print_exc())
+        raise e
 
 
 if __name__ == "__main__":
